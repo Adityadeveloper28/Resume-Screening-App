@@ -9,14 +9,23 @@ from sklearn.preprocessing import normalize
 from PyPDF2 import PdfReader
 import io
 import base64
+import time
+from streamlit import components
+
+# Set page config at the very beginning of the script
+st.set_page_config(page_title="Resume Screening App", layout="wide", initial_sidebar_state="expanded")
 
 # Download necessary NLTK data silently
 nltk.download('punkt', quiet=True)
 nltk.download('stopwords', quiet=True)
 
 # Load the updated model
-with open('resume_classifier_v8.pkl', 'rb') as f:
-    model_data = pickle.load(f)
+@st.cache_resource
+def load_model():
+    with open('resume_classifier_v8.pkl', 'rb') as f:
+        return pickle.load(f)
+
+model_data = load_model()
 
 # Unpacking the model components
 clf = model_data['classifier']
@@ -60,7 +69,6 @@ def get_feature_importance(cleaned_resume, category):
         feature_names = tfidf.get_feature_names_out()
         category_index = le.transform([category])[0]
         
-        # Check if the classifier has feature_importances_ or coef_ attribute
         if hasattr(clf, 'feature_importances_'):
             importances = clf.feature_importances_
         elif hasattr(clf, 'coef_'):
@@ -68,7 +76,6 @@ def get_feature_importance(cleaned_resume, category):
         else:
             raise AttributeError("Classifier doesn't have feature_importances_ or coef_ attribute")
         
-        # Ensure importances are 1-dimensional
         if importances.ndim > 1:
             importances = importances[category_index]
         
@@ -80,37 +87,79 @@ def get_feature_importance(cleaned_resume, category):
         st.error(f"An error occurred while getting feature importance: {str(e)}")
         return []
 
+# Function to display PDF
+def display_pdf(file):
+    # Encode PDF file to base64
+    base64_pdf = base64.b64encode(file).decode('utf-8')
+    
+    # Embed PDF viewer
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+    
+    # Display the PDF viewer
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+# Try to import plotly, if not available, set a flag
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    st.warning("Plotly is not installed. Some visualizations will not be available. Please install plotly using 'pip install plotly'.")
+
 # Main function to run the Streamlit app
 def main():
-    st.set_page_config(page_title="Resume Screening App", layout="wide")
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .main {
+        background-color: #f0f2f6;
+        padding: 2rem;
+    }
+    .stButton>button {
+        background-color: #4CAF50;
+        color: white;
+        font-weight: bold;
+    }
+    .stTextInput>div>div>input {
+        background-color: #e0e0e0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    st.title("Resume Screening App")
-    
-    uploaded_file = st.file_uploader('Upload Resume', type=['txt', 'pdf'])
+    st.sidebar.title("Resume Screening Tool")
+    uploaded_file = st.sidebar.file_uploader('Upload Resume', type=['txt', 'pdf'])
 
     if uploaded_file is not None:
         file_contents = uploaded_file.read()
 
-        if uploaded_file.type == "application/pdf":
-            resume_text = extract_text_from_pdf(file_contents)
-            
-            # Display the PDF
-            st.subheader("Original PDF")
-            pdf_display = display_pdf(file_contents)
-            st.markdown(pdf_display, unsafe_allow_html=True)
-        else:
-            try:
-                resume_text = file_contents.decode('utf-8')
-            except UnicodeDecodeError:
-                resume_text = file_contents.decode('latin-1')
+        with st.spinner('Processing resume...'):
+            if uploaded_file.type == "application/pdf":
+                resume_text = extract_text_from_pdf(file_contents)
+            else:
+                try:
+                    resume_text = file_contents.decode('utf-8')
+                except UnicodeDecodeError:
+                    resume_text = file_contents.decode('latin-1')
 
-        # Clean and process the uploaded resume
-        processed_resume = clean_resume(resume_text)
+            # Clean and process the uploaded resume
+            processed_resume = clean_resume(resume_text)
+
+        st.success('Resume processed successfully!')
+
+        col1, col2 = st.columns([1, 1])
         
-        st.subheader("Processed Resume Text")
-        st.text_area("Processed Resume Preview", processed_resume[:1000] + "..." if len(processed_resume) > 1000 else processed_resume, height=400)
+        with col1:
+            st.subheader("Original Resume")
+            if uploaded_file.type == "application/pdf":
+                display_pdf(file_contents)
+            else:
+                st.text_area("Original Text", resume_text, height=400)
         
-        # Download the processed resume as text
+        with col2:
+            st.subheader("Processed Resume")
+            st.text_area("Processed Text", processed_resume[:1000] + "..." if len(processed_resume) > 1000 else processed_resume, height=400)
+        
+        # Download button for processed resume
         st.download_button(
             label="Download Full Processed Resume Text",
             data=processed_resume,
@@ -129,21 +178,21 @@ def main():
 
         st.subheader("Top 5 Matching Job Categories")
         
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
         categories, probabilities = zip(*top_categories)
         
-        # Bar chart for top categories
-        ax1.bar(categories, [p*100 for p in probabilities])
-        ax1.set_ylabel('Probability (%)')
-        ax1.set_title('Top 5 Job Categories - Probabilities')
-        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        # Pie chart for top categories
-        ax2.pie([p*100 for p in probabilities], labels=categories, autopct='%1.1f%%', startangle=90)
-        ax2.axis('equal')
-        ax2.set_title('Top 5 Job Categories - Distribution')
-        
-        st.pyplot(fig)
+        if PLOTLY_AVAILABLE:
+            # Interactive bar chart
+            fig = go.Figure(data=[go.Bar(x=categories, y=[p*100 for p in probabilities])])
+            fig.update_layout(title='Top 5 Job Categories - Probabilities', yaxis_title='Probability (%)')
+            st.plotly_chart(fig)
+        else:
+            # Fallback to matplotlib
+            fig, ax = plt.subplots()
+            ax.bar(categories, [p*100 for p in probabilities])
+            ax.set_ylabel('Probability (%)')
+            ax.set_title('Top 5 Job Categories - Probabilities')
+            plt.xticks(rotation=45)
+            st.pyplot(fig)
 
         # Display category predictions and confidence
         for category, prob in top_categories:
@@ -151,14 +200,13 @@ def main():
             confidence_label = "High" if prob >= CONFIDENCE_THRESHOLD else "Low"
             st.write(f"{category}: {percentage:.2f}% (Confidence: {confidence_label})")
             
-            st.write("Top features for this category:")
-            feature_importances = get_feature_importance(processed_resume, category)
-            if feature_importances:
-                for feature, importance in feature_importances:
-                    st.write(f"- {feature}: {importance:.4f}")
-            else:
-                st.write("No feature importance information available for this category.")
-            st.write("---")
+            with st.expander(f"See top features for {category}"):
+                feature_importances = get_feature_importance(processed_resume, category)
+                if feature_importances:
+                    for feature, importance in feature_importances:
+                        st.write(f"- {feature}: {importance:.4f}")
+                else:
+                    st.write("No feature importance information available for this category.")
 
         # Show the model's confidence threshold
         st.subheader("Confidence Threshold")
@@ -166,13 +214,20 @@ def main():
         st.write("Predictions below this threshold are marked as 'Low' confidence.")
 
         # Analyze the distribution of probabilities across all categories
-        st.subheader("Model Analysis")
-        st.write("Distribution of probabilities across all categories:")
-        all_categories = [category_mapping[i] for i in range(len(category_mapping))]
-        fig, ax = plt.subplots(figsize=(15, 5))
-        ax.bar(all_categories, prediction_proba)
-        plt.xticks(rotation=90)
-        st.pyplot(fig)
+        with st.expander("See distribution across all categories"):
+            st.write("Distribution of probabilities across all categories:")
+            all_categories = [category_mapping[i] for i in range(len(category_mapping))]
+            if PLOTLY_AVAILABLE:
+                fig = go.Figure(data=[go.Bar(x=all_categories, y=prediction_proba * 100)])
+                fig.update_layout(title='All Categories - Probabilities', xaxis_tickangle=-45, yaxis_title='Probability (%)')
+                st.plotly_chart(fig)
+            else:
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.bar(all_categories, prediction_proba * 100)
+                ax.set_ylabel('Probability (%)')
+                ax.set_title('All Categories - Probabilities')
+                plt.xticks(rotation=90)
+                st.pyplot(fig)
 
         # Display the top N-grams found in the resume
         st.subheader("Top N-grams in Resume")
@@ -181,12 +236,6 @@ def main():
         sorted_indices = feature_vector.data.argsort()[-10:][::-1]
         top_ngrams = [feature_names[feature_vector.indices[i]] for i in sorted_indices]
         st.write(", ".join(top_ngrams))
-
-# Add this new function at the end of the file
-def display_pdf(file):
-    base64_pdf = base64.b64encode(file).decode('utf-8')
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
-    return pdf_display
 
 if __name__ == "__main__":
     main()
