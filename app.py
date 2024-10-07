@@ -4,146 +4,189 @@ import re
 import nltk
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 from sklearn.preprocessing import normalize
 from PyPDF2 import PdfReader
 import io
 import base64
 
+# Download necessary NLTK data silently
 nltk.download('punkt', quiet=True)
 nltk.download('stopwords', quiet=True)
 
-# Loading models
-clf = pickle.load(open('clf.pkl', 'rb'))
-tfidfd = pickle.load(open('tfidf.pkl', 'rb'))
+# Load the updated model
+with open('resume_classifier_v8.pkl', 'rb') as f:
+    model_data = pickle.load(f)
 
+# Unpacking the model components
+clf = model_data['classifier']
+tfidf = model_data['vectorizer']
+le = model_data['label_encoder']
+CONFIDENCE_THRESHOLD = model_data['confidence_threshold']
+
+# Helper function to clean resume text
 def clean_resume(resume_text):
-    clean_text = re.sub('http\S+\s*', ' ', resume_text)
-    clean_text = re.sub('RT|cc', ' ', clean_text)
-    clean_text = re.sub('#\S+', '', clean_text)
-    clean_text = re.sub('@\S+', '  ', clean_text)
-    clean_text = re.sub('[%s]' % re.escape("""!"#$%&'()*+,-./:;<=>?@[\]^_{|}~"""), ' ', clean_text)
-    clean_text = re.sub(r'[^\x00-\x7f]', r' ', clean_text)
-    clean_text = re.sub('\s+', ' ', clean_text)
-    return clean_text
+    resume_text = re.sub(r'http\S+\s*', ' ', resume_text)
+    resume_text = re.sub('RT|cc', ' ', resume_text)
+    resume_text = re.sub(r'#\S+', '', resume_text)
+    resume_text = re.sub(r'@\S+', '  ', resume_text)
+    resume_text = re.sub(r'[^\w\s]', '', resume_text)
+    resume_text = re.sub(r'\d+', '', resume_text)
+    resume_text = re.sub(r'\s+', ' ', resume_text).strip().lower()
+    return resume_text
 
+# Function to extract text from a PDF file
 def extract_text_from_pdf(file):
     pdf_reader = PdfReader(io.BytesIO(file))
     text = ""
     for page in pdf_reader.pages:
-        text += page.extract_text() or ""  # Handle cases where extract_text might return None
+        text += page.extract_text() or ""
     return text
 
-# Category mapping
-category_mapping = {
-    15: "Java Developer", 23: "Testing", 8: "DevOps Engineer", 20: "Python Developer",
-    24: "Web Designing", 12: "HR", 13: "Hadoop", 3: "Blockchain", 10: "ETL Developer",
-    18: "Operations Manager", 6: "Data Science", 22: "Sales", 16: "Mechanical Engineer",
-    1: "Arts", 7: "Database", 11: "Electrical Engineering", 14: "Health and fitness",
-    19: "PMO", 4: "Business Analyst", 9: "DotNet Developer", 2: "Automation Testing",
-    17: "Network Security Engineer", 21: "SAP Developer", 5: "Civil Engineer", 0: "Advocate"
-}
+# Map category indices to their corresponding labels
+category_mapping = dict(zip(range(len(le.classes_)), le.classes_))
 
+# Function to get top N categories based on prediction probabilities
 def get_top_categories(prediction_proba, top_n=5):
     top_indices = prediction_proba.argsort()[-top_n:][::-1]
     top_probs = prediction_proba[top_indices]
     top_categories = [category_mapping.get(idx, "Unknown") for idx in top_indices]
     return list(zip(top_categories, top_probs))
 
-def display_pdf(file):
-    base64_pdf = base64.b64encode(file).decode('utf-8')
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
-    return pdf_display  # Return the PDF display string
+# Function to get feature importance for a category
+def get_feature_importance(cleaned_resume, category):
+    try:
+        feature_vector = tfidf.transform([cleaned_resume])
+        feature_names = tfidf.get_feature_names_out()
+        category_index = le.transform([category])[0]
+        
+        # Check if the classifier has feature_importances_ or coef_ attribute
+        if hasattr(clf, 'feature_importances_'):
+            importances = clf.feature_importances_
+        elif hasattr(clf, 'coef_'):
+            importances = clf.coef_.ravel()
+        else:
+            raise AttributeError("Classifier doesn't have feature_importances_ or coef_ attribute")
+        
+        # Ensure importances are 1-dimensional
+        if importances.ndim > 1:
+            importances = importances[category_index]
+        
+        non_zero_features = feature_vector.nonzero()[1]
+        feature_importances = [(feature_names[i], importances[i]) for i in non_zero_features]
+        feature_importances.sort(key=lambda x: abs(x[1]), reverse=True)
+        return feature_importances[:10]
+    except Exception as e:
+        st.error(f"An error occurred while getting feature importance: {str(e)}")
+        return []
 
-def render_bar_chart_matplotlib(categories, probabilities):
-    fig, ax = plt.subplots()
-
-    # Convert probabilities to percentages
-    percentages = [prob * 100 for prob in probabilities]
-
-    # Create bar chart with categories on the x-axis
-    ax.bar(categories, percentages, color='blue')
-    ax.set_ylabel('Probability (%)')
-    ax.set_title('Top 5 Job Categories - Probabilities')
-    ax.set_xticklabels(categories, rotation=45, ha='right')  # Rotate x-axis labels for better readability
-
-    # Display the plot
-    st.pyplot(fig)
-
+# Main function to run the Streamlit app
 def main():
     st.set_page_config(page_title="Resume Screening App", layout="wide")
     
-    # Tailwind CSS CDN
-    st.markdown("""<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">""", unsafe_allow_html=True)
+    st.title("Resume Screening App")
     
-    # Custom CSS for Streamlit components
-    st.markdown("""<style>
-    .stApp { background-color: #f3f4f6; }
-    .stProgress > div > div > div { background-color: #3b82f6; }
-    .stFileUploader > div > div {
-        background-color: #e5e7eb !important;
-        padding: 0.5rem !important;
-        border-radius: 0.375rem;
-    }
-    .upload-btn { background-color: #3b82f6; color: white; padding: 0.5rem 1rem; border-radius: 0.375rem; font-weight: 600; cursor: pointer; transition: background-color 0.3s; }
-    .upload-btn:hover { background-color: #2563eb; }
-    .stFileUploader > div > div:nth-child(2) { color: black !important; font-weight: 600; margin-top: 0.5rem; }
-    .st-emotion-cache-uef7qa p { color: black; }
-    .st-emotion-cache-12xsiil { display: flex; -webkit-box-align: center; color: black; align-items: center; margin-bottom: 0.25rem; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # App layout with improved Tailwind CSS
-    st.markdown("""<div class="container mx-auto"><div class="text-center mb-12"><h1 class="text-5xl font-extrabold text-blue-600 mb-4">Resume Screening App</h1><p class="text-xl text-gray-600">Upload a resume to predict the top 5 matching job categories</p></div><div class="">""", unsafe_allow_html=True)
-
-    # File uploader inside the container
-    uploaded_file = st.file_uploader('Upload Resume', type=['txt', 'pdf'], label_visibility="collapsed")
+    uploaded_file = st.file_uploader('Upload Resume', type=['txt', 'pdf'])
 
     if uploaded_file is not None:
         file_contents = uploaded_file.read()
 
         if uploaded_file.type == "application/pdf":
             resume_text = extract_text_from_pdf(file_contents)
-            st.markdown(f'<div class="bg-white shadow-lg rounded-lg p-8 mb-8"><h2 class="text-3xl font-bold text-blue-600 mb-6">Uploaded PDF</h2>{display_pdf(file_contents)}</div>', unsafe_allow_html=True)
+            
+            # Display the PDF
+            st.subheader("Original PDF")
+            pdf_display = display_pdf(file_contents)
+            st.markdown(pdf_display, unsafe_allow_html=True)
         else:
             try:
                 resume_text = file_contents.decode('utf-8')
             except UnicodeDecodeError:
                 resume_text = file_contents.decode('latin-1')
 
-        cleaned_resume = clean_resume(resume_text)
-        input_features = tfidfd.transform([cleaned_resume])
+        # Clean and process the uploaded resume
+        processed_resume = clean_resume(resume_text)
+        
+        st.subheader("Processed Resume Text")
+        st.text_area("Processed Resume Preview", processed_resume[:1000] + "..." if len(processed_resume) > 1000 else processed_resume, height=400)
+        
+        # Download the processed resume as text
+        st.download_button(
+            label="Download Full Processed Resume Text",
+            data=processed_resume,
+            file_name="processed_resume.txt",
+            mime="text/plain"
+        )
 
+        # Convert processed resume to input features using TF-IDF vectorizer
+        input_features = tfidf.transform([processed_resume])
+
+        # Predict category probabilities and normalize them
         prediction_proba = clf.predict_proba(input_features)[0]
         prediction_proba = normalize(prediction_proba.reshape(1, -1), norm='l1')[0]
 
-        top_categories = get_top_categories(prediction_proba, top_n=5)
+        top_categories = get_top_categories(prediction_proba)
 
-        # Cleaned Resume Preview Section
-        st.markdown(f'''
-        <div class="bg-white shadow-lg rounded-lg p-8">
-            <h2 class="text-3xl font-bold text-blue-600 mb-6">Cleaned Resume Preview</h2>
-            <div class="bg-gray-100 p-6 rounded-lg">
-                <p class="text-gray-800 leading-relaxed">{cleaned_resume}...</p>
-            </div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        st.markdown(f'<div class="bg-white shadow-lg rounded-lg p-8 mb-8"><h2 class="text-3xl font-bold text-blue-600 mb-6">Top 5 Matching Job Categories</h2>', unsafe_allow_html=True)
-
-        categories = []
-        probabilities = []
+        st.subheader("Top 5 Matching Job Categories")
         
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        categories, probabilities = zip(*top_categories)
+        
+        # Bar chart for top categories
+        ax1.bar(categories, [p*100 for p in probabilities])
+        ax1.set_ylabel('Probability (%)')
+        ax1.set_title('Top 5 Job Categories - Probabilities')
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        # Pie chart for top categories
+        ax2.pie([p*100 for p in probabilities], labels=categories, autopct='%1.1f%%', startangle=90)
+        ax2.axis('equal')
+        ax2.set_title('Top 5 Job Categories - Distribution')
+        
+        st.pyplot(fig)
+
+        # Display category predictions and confidence
         for category, prob in top_categories:
             percentage = prob * 100
-            categories.append(category)
-            probabilities.append(prob)
-            st.markdown(f'<div class="mb-6"><div class="flex justify-between items-center mb-2"><span class="text-xl font-semibold text-gray-800">{category}</span><span class="text-lg font-medium text-blue-600">{percentage:.2f}%</span></div><div class="w-full bg-gray-200 rounded-full h-4"><div class="bg-blue-600 h-4 rounded-full" style="width: {percentage}%"></div></div></div>', unsafe_allow_html=True)
+            confidence_label = "High" if prob >= CONFIDENCE_THRESHOLD else "Low"
+            st.write(f"{category}: {percentage:.2f}% (Confidence: {confidence_label})")
+            
+            st.write("Top features for this category:")
+            feature_importances = get_feature_importance(processed_resume, category)
+            if feature_importances:
+                for feature, importance in feature_importances:
+                    st.write(f"- {feature}: {importance:.4f}")
+            else:
+                st.write("No feature importance information available for this category.")
+            st.write("---")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        # Show the model's confidence threshold
+        st.subheader("Confidence Threshold")
+        st.write(f"The model's confidence threshold is set to {CONFIDENCE_THRESHOLD*100}%.")
+        st.write("Predictions below this threshold are marked as 'Low' confidence.")
 
-        # Render the bar chart using Matplotlib
-        render_bar_chart_matplotlib(categories, probabilities)
+        # Analyze the distribution of probabilities across all categories
+        st.subheader("Model Analysis")
+        st.write("Distribution of probabilities across all categories:")
+        all_categories = [category_mapping[i] for i in range(len(category_mapping))]
+        fig, ax = plt.subplots(figsize=(15, 5))
+        ax.bar(all_categories, prediction_proba)
+        plt.xticks(rotation=90)
+        st.pyplot(fig)
+
+        # Display the top N-grams found in the resume
+        st.subheader("Top N-grams in Resume")
+        feature_vector = tfidf.transform([processed_resume])
+        feature_names = tfidf.get_feature_names_out()
+        sorted_indices = feature_vector.data.argsort()[-10:][::-1]
+        top_ngrams = [feature_names[feature_vector.indices[i]] for i in sorted_indices]
+        st.write(", ".join(top_ngrams))
+
+# Add this new function at the end of the file
+def display_pdf(file):
+    base64_pdf = base64.b64encode(file).decode('utf-8')
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+    return pdf_display
 
 if __name__ == "__main__":
     main()
-
